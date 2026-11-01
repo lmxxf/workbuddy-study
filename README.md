@@ -9,7 +9,8 @@
 - 内置可视化引擎（`VisualizerGuidelines` 2.6 万字规范）源码：`extracted/visualizer_guidelines_full.js`  
 - 技能/插件 `0.8 * Cosine + 0.2 * BM25` 混合检索源码：`extracted/recall_service_rag.js`  
 - 内置五阶段 Deep Research 工作流源码：`extracted/workflows/deep-research.workflow.js`  
-- 核心垂类 Skill 原件（Word 三阶段排版、Office 路由、金融投研、地图合规、专家包管理）：`extracted/skills/`
+- Python/Bash 底层安全删除与沙箱拦截源码：`extracted/sitecustomize_safe_delete.py`、`extracted/safe-delete-common.sh`、`extracted/tsbx_rules.json`、`extracted/WeComAgentConfirmSDK.h`  
+- 核心垂类 Skill 原件（Word 三阶段排版、HTML 零 LLM 门禁审查、Excel 公式三层重算与国标 AIGC 隐式打标、对抗生成 Critic 引擎、微信 AI 专属卡支付、金融投研、地图合规、专家包管理）：`extracted/skills/`
 
 ---
 
@@ -207,3 +208,107 @@
      - **对照：什么才是真正有生产力的多 Agent 协同？**
        - ❌ **垃圾范式（同底座角色扮演流水线）**：拿同一个底座模型套上“产品、架构、项目经理、开发、测试”五顶纸帽子（左手跟右手演双簧，思维盲区完全重叠），靠包工头在自然语言层复制粘贴传话——纯属把人类大厂的低效官僚病搬给了 AI；
        - ✅ **真正能打的范式（异构双底座对抗闭环 + 共享磁盘真值）**：严格拆开看其实是 **四件事**——① 制定 GPU 优化大方向、② 执行具体的底层优化工作、③ 想收工时写《性能缺口评估报告》、④ 在结束前审核《性能缺口报告》挑出数据漏洞打回。哪怕按这四件事拆成 4 个角色也行，但因为手头就两个主力底座名字，干脆让两个异构底座**一人兼两职**：**主脑（Gemini 4，兼任 ① 定方向 + ③ 写缺口报告）** 配 **重装铁匠/审稿人（GPT-6，兼任 ② 具体优化执行 + ④ 结束前审报告挑刺）**。这样既省掉了包工头在自然语言层复制粘贴传话（直接读写同一个硬盘工作区里的代码、二进制与测试脚本，零传话损耗），又歪打正着让“刚亲手摸过代码和计数器的执行者”去兼任“审报告的裁判”，谁也忽悠不了谁。
+
+---
+
+## 三、 二次深挖：全网吹爆的另外 6 个“真香特性”，源码里到底是怎么硬垫出来的？
+
+对照全网测评文章和职场博主吹得最凶的几个卖点（**“不怕删库跑路 + 一键回滚”、“生成的 Excel 发微信预览从来不会空白”、“写长报告不车轱辘话”、“手机微信随时遥控电脑干活”、“输入框一键闪光增强提示词”、“高消耗动作防乱扣费 + AI 对话里直接刷微信支付”**），继续把 `app.asar` 与 `app.asar.unpacked` 翻到底，挖出了下面这 6 套更有意思的底层代码：
+
+### 12. 吹上天的“物理级防删库 + 文件自动备份回滚”：`sitecustomize.py` 猴子补丁 + `safe-delete` 劫持 `rm` + `DocumentBackup` 三段式事务
+- **对应文件**：`extracted/sitecustomize_safe_delete.py`（1325 行）、`extracted/safe-delete-common.sh`（904 行）、`extracted/tsbx_rules.json`、`extracted/WeComAgentConfirmSDK.h`
+- **内幕细节**：
+  靠在提示词里求大模型“求求你别用 `rm -rf`”是防不住 AI 抽风的。腾讯为了兑现“事前识别、事中拦截、事后恢复”，在操作系统进程级下了三道硬锁：
+  1. **Python 运行时隐身劫持（`sitecustomize.py`）**：
+     WorkBuddy 启动任何子进程时，都会把 `cli/vendor/shim` 塞进环境变量 `PYTHONPATH` 的第一位。利用 Python 官方保留的启动自加载机制，当 AI 写的任何 Python 脚本一启动，还没跑第一行代码，就会自动 import 这份 1325 行的 `sitecustomize.py`：
+     - **先偷梁换柱保留用户环境**：先把自己的模块从 `sys.modules` 和 `sys.path` 里摘掉，尝试帮用户的 Conda/venv 加载原本的 `sitecustomize`，再把自己塞回来；
+     - **猴子补丁（Monkey-Patch）全套删除 API**：直接把标准库的 `os.remove`、`os.unlink`、`os.rmdir`、`shutil.rmtree`、`pathlib.Path.unlink`、`pathlib.Path.rmdir` 全部替换成 `_safe_remove / _safe_shutil_rmtree`；
+     - **强行改发操作系统回收站（Fail-Closed）**：AI 以为自己调了 `shutil.rmtree()` 把目录彻底抹掉了，实际上底层优先调内置二进制 `genie-trash`，或者直接通过 `ctypes` 调 Windows 的 `shell32.SHFileOperationW`（带 `FOF_ALLOWUNDO` 标志）、macOS 的 `CoreServices.FSMoveObjectToTrashSync`、Linux 的 `freedesktop Trash` 规范，**悄无声息地把文件移进系统回收站**！如果移入回收站失败，直接抛 `[SAFE_DELETE_FAIL_CLOSED]` 异常中断进程，绝不降级成真删！
+     - **读写全走 Unix Socket 向宿主讨令牌（`_brokered_open`）**：在沙箱模式下，连 `builtins.open`、`io.open`、`os.mkdir`、`os.rename` 都被打上了补丁，每次读写文件前先通过 `CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS` 发 `FileTokenRequest`，拿到 token 后调 `libc.sandbox_extension_consume` 动态解锁权限。
+  2. **Bash 层的 `rm / unlink / rmdir` 假命令劫持（`safe-delete-common.sh`）**：
+     在 `PATH` 最前面塞了一组假的 `rm`、`unlink`、`rmdir` 脚本。里面全是老程序员被 Windows 折磨出来的血泪注释：
+     - *“纯 bash JSON 字符串转义：避免 python（Windows Store stub 每次调用 1-4 秒且 stdout 可能空，写出非法 JSON 导致静默丢弃‘已移入回收站’提示）”*；
+     - *“去掉 `$PWD` 尾部斜杠：`$PWD=/` 时裸拼接会产出 `//foo`，被 Windows 解释为 UNC `\\foo` 触发网络解析卡死 120s”*；
+     - *“用数组分片而不是 heredoc：heredoc 在 bash 内部会落一个临时文件再 unlink（`/tmp/sh-thd-*`），在沙箱 broker 场景下这次 unlink 会被 Seatbelt 的监控误判为一次‘受保护文件修改’拦截，抢在批量删除确认信号之前触发提权 UI”*。
+  3. **企业微信 C++ 原生二次确认弹窗（`WeComAgentConfirmSDK.h`）+ Office 修改三段式事务备份（`edsdk.py`）**：
+     - 遇到高危拦截时，通过 `WeComAgentConfirmSDK.dll` 用 Win32 `WM_COPYDATA` 跨进程唤醒电脑上的企业微信客户端弹出原生确认框；
+     - 而在修改本地 Word/Excel/PPT 时（见 `edsdk_backup_test.py`），每次写操作与保存都被包在宿主 IPC 的 **`("ipc", "edit") -> ("ipc", "prepare", 拿 save-ticket 落盘历史快照) -> ("sdk", "save_file") -> ("ipc", "complete" / 失败则 "cancel")`** 事务里——这就是评测里吹的“AI 改坏了本地表格可以一键回滚上一版”的真相。
+  4. **`tsbx_rules.json` 沙箱规则里的爆笑漏网之鱼**：
+     打开内置沙箱策略 `cli/vendor/sandbox/5.9.5/tsbx_rules.json` 第 59–65 行，除了禁掉 `.ssh` 和 `.gnupg`，白名单里居然赫然写着：
+     ```json
+     { "path": "C:\\openclaw\\openclaw\\**",   "action": "read=allow|write=allow|delete=allow", "_comment": "openclaw app" },
+     { "path": "%USERPROFILE%\\.openclaw\\**", "action": "read=allow|write=allow|delete=allow", "_comment": "openclaw config" },
+     { "path": "D:\\openclaw\\proxy-agent\\**","action": "read=allow|write=allow|delete=allow", "_comment": "Add custom file rules here." }
+     ```
+     **连腾讯开发者的 D 盘 `D:\openclaw\proxy-agent\**` 路径都原封不动打包发给全网用户了** 😂！
+
+---
+
+### 13. 为什么别的 AI 生成的 Excel 发到微信/手机预览全是空白，WorkBuddy 的却能直接看？（`recalc.py` 三层公式重算 + `aigc_label.py` 国标隐式打标）
+- **对应文件**：`extracted/skills/sheet_recalc.py`（955 行）、`extracted/skills/xlsx_aigc_label.py`（305 行）
+- **内幕细节**：
+  1. **痛点**：大模型用 `openpyxl` 生成 Excel 表格时，写入的 `=SUM(A1:A10)` 只是 XML 里的 `<f>` 公式字符串，**没有 `<v>` 缓存计算结果**。只要用户没在电脑上用 Excel 打开并保存过，直接把这个 `.xlsx` 发到微信、企业微信、手机预览或者用 `pandas / load_workbook(data_only=True)` 读，所有公式单元格读出来全是 **`None`（一片空白）**！
+  2. **腾讯的三层降级强行回填（`sheet_recalc.py`）**：
+     WorkBuddy 在交付任何 `.xlsx` 前，强制跑一遍 `recalc.py`：
+     - **第一层（LibreOffice StarBasic 宏静默重算）**：如果本机找得到 `soffice`，脚本会动态创建一个隔离的 LibreOffice Profile，往 `user/basic/SheetAgent/Recalculate.xba` 注入一段 **StarBasic 宏代码**（调 `ThisComponent.calculateAll()` + `ThisComponent.store()`），后台无头启动 LibreOffice 把整张表的公式算完存盘；
+     - **第二层（纯 Python `formulas` 引擎求值 + 手撕 OOXML 注入 `<v>`）**：如果用户电脑没装 LibreOffice，它就调 Python 的 `formulas` 库在内存里把 Excel 公式算出来，然后**直接把 `.xlsx` 当成 ZIP 包解压，解析 `xl/workbook.xml` 和 `sheetN.xml`，在不破坏 `<f>` 公式的前提下，把算出来的数值硬塞进旁边的 `<v>` 缓存节点里**！甚至还专门防了外部工作簿引用丢失缓存变成 `#NAME?` 的坑，以及 `TRANSPOSE / FILTER / UNIQUE` 等 29 个动态数组函数被静默折叠成单值的坑。
+  3. **往 `.xlsx` 内部偷偷焊入 `GB 45438-2025` 国家标准 AIGC 隐式水印（`xlsx_aigc_label.py`）**：
+     每次生成本地 Excel 表格后，都会自动调 `aigc_label.py` 修改 `.xlsx` 压缩包里的 `docProps/custom.xml`、`_rels/.rels` 和 `[Content_Types].xml`，写入名为 `AIGC` 的自定义属性：
+     ```json
+     {"Label":"1","ContentProducer":"00119111010856365494821B355","ProduceID":"<随机UUID>","ContentPropagator":"00119111010856365494821B355","PropagateID":"<随机UUID>"}
+     ```
+     脚本注释里还极其诚实地交代了一段体制内合规博弈（第 85–90 行）：按腾讯 CSIG 规范（`iWiki 4015184282`），本来还得用私钥算 `ReservedCode1` 签名，但**“私钥不能随插件分发到用户机器，填一个本地随机密钥加密、密钥用完即弃的值，在构造上就不可能被任何人校验——留空比填这种值更诚实”**，并且为了防止自己的 `--check` 关卡因为缺签名把自己卡死，特地把 `ReservedCode1` 从本地必填校验里摘掉了 😂。
+
+---
+
+### 14. 怎么治好大模型“自我审查走过场、一审就过”？——`Critic-Generator` 盲审隔离 + 强制扣分配额引擎 + `review_html.py` 零 LLM 门禁
+- **对应文件**：`extracted/skills/critic-generator-engine.md`（340 行）、`extracted/skills/review_html.py`（859 行）
+- **内幕细节**：
+  为什么普通人让 AI “写完自己检查一遍”，AI 永远回答“整体不错、基本满足”，而 WorkBuddy 的专家模式能真的挑出毛病重改？它用了“一文一武”两套死规矩：
+  1. **文审（`critic-generator-engine.md` 六步对抗状态机）**：
+     - **Step ① Isolate（物理剥离作者脑回路）**：严禁把生成初稿时的思维链和上下文传给审查步，只准打包一份“盲审包（待审文本 + 需求画像 + 原始素材五元组）”，明确写死：**`“❌ 禁止在审查时回忆生成过程的思考为当前内容辩护”`**；
+     - **Step ② LoadRubrics（延迟加载尺规）**：**严禁在写作阶段加载评分标准**（注释原话：*“若在写作时就加载几万字 rubrics，会让模型的创作注意力被规则淹没，初稿质量反而下降；延迟到审查时才加载，生成阶段纯净、审查阶段严苛”*）；
+     - **Step ④ Challenge（强制否定配额，禁止全部通过！）**：硬性规定每次审查 **至少要有 `min_issues`（默认 2 个）维度扣分，至少开出 `min_instructions`（默认 3 条）带 `定位 + 问题 + P0/P1/P2 严重度 + 具体修改方向` 的整改单**！如果文章写得太好凑不够扣分配额怎么办？引擎铁律：**`“配额不足时强制下沉到段落级检查，找最弱的 2-3 个段落生成指令，严禁输出‘全部通过’！”`** 😂
+  2. **武审（`review_html.py`：0 次 LLM 往返的纯 Python AST 门禁）**：
+     在排版 HTML 转 Word 之前，根本不信大模型的眼睛，直接跑 859 行纯标准库写的 `review_html.py`，从 6 个维度硬扫 DOM 树和 CSS：
+     - 只要 CSS 里出现裸色值（`#xxx` / `rgb()`）没用 `var(--color-*)`，直接报 `[DT-01]` 扣分；
+     - 只要出现裸字号（`px/pt`）没用 `var(--fs-*)`，报 `[DT-02]`；
+     - `<h1>` 后面直接跳 `<h3>` 报 `[SI-01]` 扣 15 分、`<table>` 缺 `<thead>` 扣 20 分、`<p>` 里套块级元素扣 15 分；
+     - 算出来总分 `< 80` 分直接返回退出码 `1` 打回重排，不耗费半个 LLM Token！
+
+---
+
+### 15. “人在地铁，手机微信/企微/QQ/飞书远程遥控电脑干活”是怎么打通的？
+- **对应文件**：`app.asar -> /main/weixin.js`、`/main/wecom-new.js`、`/main/qq.js`、`/main/feishu.js`、`/main/dingtalk.js`、`extracted/fragments/wecom-routing.md`
+- **内幕细节**：
+  评测里吹爆的“在手机微信上发语音拍照，家里/工位电脑上的 WorkBuddy 自动操作本地文件夹干活”，在主进程里有两套完整实现：
+  1. **个人微信通道（`/main/weixin.js`）**：直接连腾讯内部的 **`https://ilinkai.weixin.qq.com/ilink/bot/`** 接口（认证头 `AuthorizationType: ilink_bot_token` + 随机生成的 `X-WECHAT-UIN`），长轮询拉取手机微信发来的文字、图片、语音、文件、视频，把桌面端伪装成一个 `channel_version: "workbuddy-desktop-1.0.0"` 的 iLink 机器人；同时还配了一个 C++ 原生插件 `native/wechat-copydata-decoder/build/Release/wechat_copydata_decoder.node` 专门解码 PC 微信通过 `WM_COPYDATA` 传过来的本地结构体。
+  2. **企业微信双轨铁律（`wecom-routing.md`）**：
+     - 规定在中文回复里永远只准写 **“企业微信”**，**严禁缩写成“企微”**；
+     - 严格切成两条互斥通道：**发消息/读群聊/找聊天文件** 必须通过 `A2A（Agent-to-Agent）` 协议委派给一个代号叫 **`Dayuan`（大元）** 的企微聊天 Agent；而 **操作企微文档、微盘（WeDrive）、智能表格、日程、会议、待办、邮件** 必须走本地捆绑的 `wecom-cli`（通过环境变量注入 `WECOM_CLI_ACCESS_TOKEN`，遇到 `errcode: 850002` 则原样吐出授权链接让用户点）。
+  3. **多平台全家桶 + E2B 云端沙箱**：`/main/` 下同时内置了 `qq.js`（连 `https://api.sgroup.qq.com` QQ 机器人）、`feishu.js`（飞书）、`dingtalk.js`（钉钉）、`telegram.js`、`discord.js`、`slack.js` 以及 `yuanbao.js`（腾讯元宝）；而所谓的“关掉电脑也能 7×24 小时云端托管”，在 `/main/e2b-filesystem.js` 里直接露了底——底层接的是开源云端沙箱方案 **E2B（`E2BFilesystem`）**。
+
+---
+
+### 16. 输入框右下角“小闪光图标（一键增强提示词）”背后藏着的 Prompt
+- **对应文件**：`app.asar -> /main/server.js`（`llm:enhancePrompt`）
+- **内幕细节**：
+  很多小白教程推荐“不会写 Prompt 就点右下角的小闪光图标，AI 自动把大白话改写成专业指令”。扒开 `server.js` 里的 `Kr = "llm:enhancePrompt"`，它后台其实是调 `CliPulseClient` 跑了一段硬编码的英文 System Prompt（`Jr`）：
+  - 设定身份为 *"You are a Prompt Engineering Expert specializing in improving user prompts for a development code assistant"*；
+  - 规定改写后的 Prompt **长度严格控制在 800 字符以内**，只准讲 **WHAT（做什么）**，严禁解释 **HOW（怎么做）**，严禁替用户指定原话没提过的技术栈（哪怕内置的英文 Few-shot 例子自己就违规把 *"A website for my dog"* 扩写成了 *"Design a personalized Next.js website..."* 😂）；
+  - 最核心的是连写 6 条全大写的语言死命令（`CRITICAL PRIORITY - LANGUAGE CONSISTENCY`）：用户写中文就必须 100% 输出中文，用户中英混杂就保持自然的中英混杂，绝不准擅自翻译。
+
+---
+
+### 17. 防止用户吐槽“积分刺客”的双层计费闸门、微信 AI 专属卡支付与 CLI 预热池
+- **对应文件**：`extracted/skills/weixinpay-pay.md`、`app.asar.unpacked/.../high-credit-tools.json`、`buddy-image-processing/high-credit-commands.json`、`app.asar -> /main/cli-prewarm-pool.js`
+- **内幕细节**：
+  1. **被大模型绕过一次后紧急打补丁的“高积分双层闸门”（`issue #121874` & `issue #139526`）**：
+     在 `high-credit-commands.json` 的注释里，腾讯程序员记录了一个极其真实的 Agent 逃票事故：
+     > *“背景：计费确认原先只挂在 Skill 工具调用上，模型在同一会话内复用已加载的 skill 知识、直接以 Bash 执行 `buddy-image-processing.py` 脚本时不会再次经过 Skill 工具，审批点被绕过！本清单把门禁延伸到‘脚本真正执行前’：命中命令特征的 Bash 调用由 CLI 内建判定拦截。”*
+     而且在 `high-credit-tools.json` 里规定：画图（`miora-image`）和生成视频（`miora-video`）的“本次会话始终允许”审批记忆必须严格分组隔离——**“图片与视频刻意分组：允许生成图片不应顺带授权更贵的视频”**；一旦工具声明了非法 `approvalKind`，为防“浮层静默不显示但工具照跑照扣积分”，强制 Fail-Closed 弹窗拦截。
+  2. **微信支付 AI 专属卡与 `X402 WeixinPay-Required` 协议（`weixinpay-pay.md`）**：
+     WorkBuddy 已经内置了微信支付官方的 **“微信支付 AI 专属卡（`agentpay`）”** MCP 服务！商户工具返回 `WeixinPay-Required` 一次性凭证（借鉴 HTTP 402 Payment Required 的 X402 协议）时，桌面端会用确定性代码拦截并弹出微信支付卡片让用户确认扣款，严禁把 `paymentCode` 原始字符串暴露给大模型展示在聊天框里；如果用户取消后说“重新付一次”，强制大模型必须先发问确认订单名称、等用户明确回“是/确认”后，才准逐字符原样复用上次的 `paymentCode` 调 `mcp__weixinpay__weixinpay_retry_pay`。
+  3. **为什么点开新对话响应那么快？——`CliPrewarmPool` 后台进程预热池 + PDF 退出码 `69`**：
+     - 在 `/main/cli-prewarm-pool.js` 里，主进程在后台偷偷维护了一个 `cbc-prewarm` 预热池，提前 spawn 好带默认环境变量的 `codebuddy` CLI 子进程；一旦用户发起会话，比对 35 个白名单环境变量（`k = new Set(...)`）无冲突后直接热接管，省掉 Node.js 冷启动的几秒延迟；
+     - 甚至为了缩小 181 MB 安装包的体积，连 PDF 解析器 `workbuddy-pdf` 二进制都是空的占位符——当 AI 第一次调 `workbuddy-pdf` 时，占位程序会返回特殊退出码 **`69`（组件尚未就绪，后台正在偷偷下载）**，并在 `workbuddy-pdf/SKILL.md` 第 24 行叮嘱大模型：**“看到退出码 69 说明后台下载还没完成，隔几秒重试同一条命令即可，千万不要自己去 `pip install` 或 `brew install`！”** 😂
