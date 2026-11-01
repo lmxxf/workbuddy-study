@@ -312,3 +312,38 @@
   3. **为什么点开新对话响应那么快？——`CliPrewarmPool` 后台进程预热池 + PDF 退出码 `69`**：
      - 在 `/main/cli-prewarm-pool.js` 里，主进程在后台偷偷维护了一个 `cbc-prewarm` 预热池，提前 spawn 好带默认环境变量的 `codebuddy` CLI 子进程；一旦用户发起会话，比对 35 个白名单环境变量（`k = new Set(...)`）无冲突后直接热接管，省掉 Node.js 冷启动的几秒延迟；
      - 甚至为了缩小 181 MB 安装包的体积，连 PDF 解析器 `workbuddy-pdf` 二进制都是空的占位符——当 AI 第一次调 `workbuddy-pdf` 时，占位程序会返回特殊退出码 **`69`（组件尚未就绪，后台正在偷偷下载）**，并在 `workbuddy-pdf/SKILL.md` 第 24 行叮嘱大模型：**“看到退出码 69 说明后台下载还没完成，隔几秒重试同一条命令即可，千万不要自己去 `pip install` 或 `brew install`！”** 😂
+
+---
+
+### 18. 实测“你好”底仓开销与腾讯保 GPU 算力的“连环三刀”（为什么白嫖党觉得 AI 写代码不行？）
+- **对应文件**：`cli/product.json`（`models` 与 `tokenUsageThresholds`）、`cli/dist/codebuddy-lite-wb.mjs`（`resolveCompactTriggerAt`）、本地 SQLite `workbuddy.db`（`session_usage` 表）与会话 `.jsonl`
+- **内幕细节**：
+  1. **只发两个字“你好”，开局底仓直接吃掉 `32,739` 个 Token！**
+     新建一个 `deepseek-v4.1-flash` 会话，只输入一句 **`“你好”`**，直接扒取本地 SQLite `session_usage` 表与 `.jsonl` 里的 API `rawUsage` 账单：
+     ```json
+     "prompt_tokens": 32739,
+     "completion_tokens": 304,
+     "reasoning_tokens": 194,
+     "total_tokens": 33043,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 32739,
+     "credit": 0
+     ```
+     用户那句“你好”只占 1 个 Token，剩下 **`32,738` 个 Token 全是开局硬塞进去的系统提示词 `.tpl`、内置工具 Schema、办公/金融 Skill 列表和那四个 `SOUL.md / BOOTSTRAP.md / IDENTITY.md / USER.md` 模板**！一句话还没开始干活，3.3 万 Token 已经垫进去了。
+  2. **为什么 `DeepSeek-V4.1-Flash` 的 1M 上下文只占不到 1GB 显存，腾讯却死活不敢放开窗口？（保 GPU 算力的“连环三刀”）**
+     得益于 MLA + CSA/HCA，DeepSeek-V4.1-Flash 跑 1M 上下文的 KV Cache 显存连 1GB 都不到，所以腾讯在 `product.json` 里敢把它和自家的混元 3（`hy3`）标成全场仅有的两个 **`x0.00 credits`（纯免费白嫖）** 模型（对比：`gpt-6-astra` 是天价 `x6.67 credits`）。
+     **但显存不要钱，GPU 的 Attention 算力（FLOPs）要命！** 一旦白嫖党挂着几十万上下文循环跑 Agent，且经常 `prompt_cache_hit_tokens: 0`，随序列长度暴涨的 Prefill/Attention 计算量会直接把免费池的 GPU 算力烧穿。于是腾讯在代码里下了连环三刀：
+     - **第一刀（默认缩水）**：宣传文案写着“支持 1M 上下文窗口”，但 `product.json` 里 `defaultLength` 默认锁死在 **`300,000`（300K）**；
+     - **第二刀（40%～50% 提前腰斩压缩）**：在 `product.json` 的 `tokenUsageThresholds` 里，硬编码了极度激进的强制压缩红线：
+       ```json
+       "tokenUsageThresholds": {
+         "compact": { "emergency": 0.4, "modelOverrides": { "deepseek": 0.5 } },
+         "summary": { "emergency": 0.15 },
+         "inputTokens": { "warning": 0.6, "critical": 0.7, "emergency": 0.9, "preMessage": 0.5 }
+       }
+       ```
+       结合 `codebuddy-lite-wb.mjs` 里的触发公式 `resolveCompactTriggerAt(R, A, I) -> R * A`：名义上给你看一个 `300K` 的进度条，实际上只要上下文刚涨到 **`120K`（`0.4` 紧急线）~ `150K`（`0.5` 预压缩线）**——扣掉开局自带的 `33K` 僵尸提示词，用户真正能塞进去的代码和对话只有 **`90K ~ 117K`**——壳子就会当场触发 Auto-Compact，把全部历史上下文压成 `15%` 的摘要清零重来！
+     - **第三刀（本地自挂 Qwen 27B 等小模型更是惨案）**：如果用户自己挂一个 64K 窗口的本地 Qwen 27B，按 `0.5` 红线算（`32K`）还不够装它开局自带的 `32,738` Token 系统提示词，第一轮聊完当场就得触发压缩失忆 😂！
+  3. **舆论场的闭环：为什么白嫖党成了“AI Agent 写代码根本不行”的代言人？**
+     - 在 **日常办公场景**（排红头文件、算 Excel、画 SVG 架构图），因为是高度标准化的有限状态机，腾讯工程师用几万行死规则、`review_html.py` 门禁和 `recalc.py` 预制菜脚本把 90% 的活儿干完了，底下哪怕是免费模型当填空题工人也能交出 85 分的漂亮文档，所以白嫖党惊呼“办公真香，免费头牌”；
+     - 一旦转头去 **写真实代码工程**，没有任何预制菜脚本能替模型兜底，再加上“齐活林/许清楚/寇豆码”多角色二传手传话丢一半信息、聊两轮刚到 120K 就被 `0.4/0.5` 红线强制压缩失忆——白嫖党拿着被捆手捆脚又被斩腰截断的免费壳子翻车现场，跑到全网当懂王宣称：“我都试过了，AI Agent 写代码就是个记不住上下文的玩具！” 😏
