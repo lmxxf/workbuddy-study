@@ -10,7 +10,8 @@
 - 技能/插件 `0.8 * Cosine + 0.2 * BM25` 混合检索源码：`extracted/recall_service_rag.js`  
 - 内置五阶段 Deep Research 工作流源码：`extracted/workflows/deep-research.workflow.js`  
 - Python/Bash 底层安全删除与沙箱拦截源码：`extracted/sitecustomize_safe_delete.py`、`extracted/safe-delete-common.sh`、`extracted/tsbx_rules.json`、`extracted/WeComAgentConfirmSDK.h`  
-- 核心垂类 Skill 原件（Word 三阶段排版、HTML 零 LLM 门禁审查、Excel 公式三层重算与国标 AIGC 隐式打标、对抗生成 Critic 引擎、微信 AI 专属卡支付、金融投研、地图合规、专家包管理）：`extracted/skills/`
+- 核心垂类 Skill 原件（Word 三阶段排版、HTML 零 LLM 门禁审查、Excel 公式三层重算与国标 AIGC 隐式打标、对抗生成 Critic 引擎、微信 AI 专属卡支付、金融投研、地图合规、专家包管理）：`extracted/skills/`  
+- 上下文压缩（`/compact` 三级策略与提示词）及 `skill-creator` 原件与源码：`extracted/compact-skill-20261106/`
 
 ---
 
@@ -347,3 +348,38 @@
   3. **舆论场的闭环：为什么白嫖党成了“AI Agent 写代码根本不行”的代言人？**
      - 在 **日常办公场景**（排红头文件、算 Excel、画 SVG 架构图），因为是高度标准化的有限状态机，腾讯工程师用几万行死规则、`review_html.py` 门禁和 `recalc.py` 预制菜脚本把 90% 的活儿干完了，底下哪怕是免费模型当填空题工人也能交出 85 分的漂亮文档，所以白嫖党惊呼“办公真香，免费头牌”；
      - 一旦转头去 **写真实代码工程**，没有任何预制菜脚本能替模型兜底，再加上“齐活林/许清楚/寇豆码”多角色二传手传话丢一半信息、聊两轮刚到 120K 就被 `0.4/0.5` 红线强制压缩失忆——白嫖党拿着被捆手捆脚又被斩腰截断的免费壳子翻车现场，跑到全网当懂王宣称：“我都试过了，AI Agent 写代码就是个记不住上下文的玩具！” 😏
+
+
+
+---
+
+### 19. 上下文压缩（`/compact`）的“抠门剪刀 + 催眠乌龙”：三级策略与三套互相打架的模板
+- **对应文件**：`extracted/compact-skill-20261106/engineering-compactor.js`、`extracted/compact-skill-20261106/summary-router.js`、`extracted/compact-skill-20261106/prompts/`、`extracted/compact-skill-20261106/compact-prompts.zh.md`
+- **内幕细节**：
+  扒开 `codebuddy-lite-wb.mjs`（偏移 `7904022~7950372`）与 `product.json`，它的压缩路由按优先级分为 **`PreMessage(3000) -> MaxToken(2000) -> Blocking(1000)`** 三条路径，藏着两处极有意思的设计：
+  1. **高优路径（`PreMessage`）先上“无脑剪刀”（`HistoryEngineeringCompactor`），压进 15% 就一分钱 LLM 都不花**：
+     当用户手动触发或触发消息前压缩时，它根本不急着调大模型，而是先用纯 JS 规则把历史记录里的所有 **工具返回结果（`function_call_result`）、模型思考过程（`reasoning`）、以及写文件工具参数里的 `content / new_string / widget_code` 代码正文** 统统剪掉，替换成 `<omitted />` 占位符。然后按 `Math.ceil(字符串长度 / 4)` 粗估 Token：只要删完后的残骸 `<= 有效上下文预算 × 15%`（注：第 18 节 `summary.emergency = 0.15` 实为这里的免 LLM 门槛，活动运行链的自动压缩主阈值为 `inputTokens.emergency = 0.9` 与条件式 `preMessage = 0.5`），它就 **直接跳过大模型调用**，把这个被掏空了工具结果与代码正文的空架子包进 `<cb_summary>` 塞回上下文交差！
+  2. **一旦剪刀剪完仍超 15%，调 LLM 二压时直接引爆“假完工催眠乌龙”（`context-summary-prompt`）**：
+     如果工程删减后体积还是超过 15%，它会调用无工具的 `contextSummary` Agent 跑二次总结（要求总长 `< 1000` 词）。结果打开 `extracted/compact-skill-20261106/prompts/context-summary-prompt.txt` 一看，模板第 1 步居然硬编码写死了两行死命令：
+     ```xml
+     <conversation_history_summary>
+     Summary of the conversation between an AI agent and a user.
+     All tasks described below are already completed.
+     **DO NOT re-run, re-do or re-execute any of the tasks mentioned!**
+     Use this summary only for context understanding.
+     ```
+     **哪怕你是活儿干到一半触发了压缩，这个二压模板也会强制给摘要贴上“以下所有任务均已完成，严禁重跑或继续执行”的封条**，把接班窗口的 AI 彻底催眠！而到了超限恢复路径（`MaxToken` 走 `context-summary-max-token-prompt`）和兜底路径（`Blocking` 走高仿 Claude Code 的 9 节 `compact-prompt`），模板又反过来要求保留 `7. Pending Tasks` 和 `8. Current Work`——三套模板在状态语义上自己跟自己打架 😂。
+
+---
+
+### 20. 技能创建器（`skill-creator`）：与 OpenAI Codex 同源的“祖传模板” + 虚张声势的 `quick_validate.py`
+- **对应文件**：`extracted/compact-skill-20261106/skill-creator/SKILL.md`、`extracted/compact-skill-20261106/skill-creator/scripts/`、`extracted/compact-skill-20261106/skill-creator.zh.md`
+- **内幕细节**：
+  WorkBuddy 内置没有 `/learn` 斜杠命令，而是随包附带了一个 `skill-creator` 技能（14,318 字节）。拿它跟 OpenAI `Codex CLI` 内置的 `skill-creator` 逐段比对，直接扒出三个好玩的内幕：
+  1. **与 OpenAI Codex 100% 同源的“祖传三例”**：
+     两家的 `SKILL.md` 都是拿 Anthropic 早期开源的那版 `skill-creator` 改出来的同源兄弟——不仅三级按需加载（`Metadata ~100词常驻 -> SKILL.md <5k词触发加载 -> scripts/ references/ assets/ 按需调用`）的描述一模一样，连正文第 2 步举的三个例子（`pdf-editor` 存 `scripts/rotate_pdf.py`、`frontend-webapp-builder` 存 `assets/hello-world/`、`big-query` 存 `references/schema.md`）都逐字重合 😂。
+  2. **腾讯塞进去的两处本土权限私货**：
+     - **强制打上 `agent_created: true` 烙印**：规定凡是 AI 创建的技能，YAML 头部必须写 `agent_created: true`，否则 `skill_manage` 工具拒绝修改或删除（但搞笑的是，它自带的 `scripts/init_skill.py` 生成模板时居然忘了自动填上这个字段，全靠大模型自己记得手补）；
+     - **防技能市场静默覆盖锁（`userModified: true`）**：当用户说“帮我编辑某个从市场安装的技能”时，提示词强制要求保存后去同目录找 `_skillhub_meta.json` 或 `_knot_meta.json`，写入 `"userModified": true`，防止后台市场更新时把用户改过的提示词偷偷覆盖掉。
+  3. **提示词吹得震天响，`quick_validate.py` 打开只有几十行正则**：
+     `SKILL.md` 第 5 步信誓旦旦地宣称打包脚本 `package_skill.py` 会自动校验“描述完整性与质量、文件组织与资源引用”；结果打开底层的 `extracted/compact-skill-20261106/skill-creator/scripts/quick_validate.py`（共 95 行）一看，里面只用正则查了一下有没有 `name:` / `description:`、是不是连字符命名、描述有没超 1024 字符或带尖括号 `<>`——所谓的“语义质量与文件引用检查”根本没写进代码里，纯属写在提示词里吓唬 AI 的场面话 😏。
